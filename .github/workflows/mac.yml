@@ -1,0 +1,19 @@
+name: worker
+
+on: 
+  watch:
+    types: [started]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+      
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
