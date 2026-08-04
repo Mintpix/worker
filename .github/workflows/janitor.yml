@@ -1,0 +1,36 @@
+name: cleanup
+
+on:
+  workflow_run:
+    # workflow_run requires an explicit list (no wildcard support).
+    # Add new workflow names here when adding workflows.
+    workflows: [nix, blog, worker]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Get triggering workflow filename
+        id: wf
+        run: echo "name=${WORKFLOW_PATH##*/}" >> "$GITHUB_OUTPUT"
+        env:
+          WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+      - name: Delete all runs of the triggering workflow
+        continue-on-error: true
+        uses: iamazeem/delete-workflow-runs-action@v1
+        with:
+          workflow: ${{ steps.wf.outputs.name }}
+          keep: 0
+      - name: Delete old janitor runs
+        continue-on-error: true
+        uses: iamazeem/delete-workflow-runs-action@v1
+        with:
+          workflow: janitor.yml
+          keep: 1

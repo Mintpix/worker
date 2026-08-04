@@ -1,0 +1,103 @@
+name: nix
+
+on:
+  repository_dispatch:
+    types: [nix]
+  workflow_dispatch:
+    inputs:
+      use-lock:
+        description: Use the committed flake.lock
+        required: false
+        type: boolean
+        default: false
+      debug:
+        description: Start a tmate session
+        required: false
+        type: boolean
+        default: false
+      hosts:
+        description: 'Arch-prefixed hostname(s), e.g. arm-xxx x86-xxx'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          HOSTS: ${{ inputs.hosts }}
+        run: |
+          if [[ -z "$HOSTS" ]]; then
+            matrix='[{"arch":"x86","runner":"ubuntu-latest"},{"arch":"arm","runner":"ubuntu-24.04-arm"}]'
+          else
+            matrix='[]'
+            for token in $HOSTS; do
+              case "${token%%-*}" in
+                x86) matrix=$(jq -c '. + [{"arch":"x86","runner":"ubuntu-latest"}]' <<<"$matrix") ;;
+                arm) matrix=$(jq -c '. + [{"arch":"arm","runner":"ubuntu-24.04-arm"}]' <<<"$matrix") ;;
+              esac
+            done
+          fi
+          echo "matrix=$(jq -c 'unique' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: select
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.matrix) }}
+    concurrency:
+      group: nix-deploy-${{ matrix.arch }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.NIX_REPO }}
+          token: ${{ secrets.SOURCE_PAT }}
+          ref: master
+          path: nix
+          fetch-depth: 1
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install deployment tools
+        run: nix profile add nixpkgs#cachix nixpkgs#sops nixpkgs#ssh-to-age nixpkgs#nixos-rebuild
+      - name: Update flake lock
+        if: github.event_name != 'workflow_dispatch' || inputs.use-lock != true
+        working-directory: nix
+        run: nix flake update
+      - name: Deploy
+        working-directory: nix
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          requested="${{ github.event.inputs.hosts }}"
+          if [[ -n "$requested" ]]; then
+            targets=()
+            for host in $requested; do
+              [[ "${host%%-*}" == "${{ matrix.arch }}" ]] && targets+=("${host#*-}")
+            done
+            if [[ ${#targets[@]} -eq 0 ]]; then
+              echo "::notice::No ${{ matrix.arch }} hosts requested, skipping deploy"
+              exit 0
+            fi
+            echo "Deploying: ${targets[*]}"
+            bash worker.sh "${targets[*]}"
+          else
+            bash worker.sh ${{ matrix.arch }}
+          fi
+      - name: Setup tmate session
+        if: github.event_name == 'workflow_dispatch' && inputs.debug == true
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
