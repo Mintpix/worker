@@ -1,0 +1,110 @@
+name: nix
+
+on:
+  workflow_dispatch:
+    inputs:
+      use-lock:
+        description: Use the committed flake.lock
+        required: false
+        type: boolean
+        default: false
+      debug:
+        description: Start a tmate session
+        required: false
+        type: boolean
+        default: false
+      hosts:
+        description: 'Arch-prefixed hostname(s), e.g. arm-xxx x86-xxx; empty deploys every host'
+        required: false
+        type: string
+      reboot:
+        description: Reboot the deployed hosts and wait until they go offline
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Checkout nix
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.NIX_REPO }}
+          token: ${{ secrets.SOURCE_PAT }}
+          ref: master
+          path: nix
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@v2
+      - name: Select deploy targets
+        id: select
+        working-directory: nix
+        env:
+          HOSTS: ${{ inputs.hosts }}
+          REBOOT: ${{ inputs.reboot }}
+        # Only matrix= reaches stdout: errors go to stderr so the output file stays clean.
+        run: bun scripts/worker.ts ci select >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: select
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.matrix) }}
+    concurrency:
+      group: nix-deploy-${{ matrix.arch }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout worker
+        uses: actions/checkout@v7
+      - name: Checkout nix
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.NIX_REPO }}
+          token: ${{ secrets.SOURCE_PAT }}
+          ref: master
+          path: nix
+          fetch-depth: 1
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install deployment tools
+        run: nix profile add nixpkgs#cachix nixpkgs#sops nixpkgs#ssh-to-age nixpkgs#nixos-rebuild nixpkgs#bun
+      - name: Update flake lock
+        if: inputs.use-lock != true
+        working-directory: nix
+        run: nix flake update
+      - name: Deploy
+        id: deploy
+        working-directory: nix
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Host input arrives through env: interpolating it into the script would
+          # let a crafted value inject shell syntax before bash ever parses it.
+          HOSTS: ${{ inputs.hosts }}
+          REBOOT: ${{ inputs.reboot }}
+        run: bun scripts/worker.ts ci deploy --arch "${{ matrix.arch }}"
+
+      # success() alone allows a skipped step, so the deploy outcome is checked too.
+      - name: Reboot deployed hosts
+        if: success() && inputs.reboot && steps.deploy.outcome == 'success'
+        working-directory: nix
+        env:
+          HOSTS: ${{ inputs.hosts }}
+          REBOOT: ${{ inputs.reboot }}
+        run: bun scripts/worker.ts ci reboot --arch "${{ matrix.arch }}"
+
+      - name: Setup tmate session
+        if: inputs.debug == true
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true

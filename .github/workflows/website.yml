@@ -1,0 +1,80 @@
+name: website
+
+on:
+  repository_dispatch:
+    types: [website]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-pages-production
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 站点公开地址由 Secret 注入；检查、构建、测试步骤共用，日志不展开该值。
+      SITE_URL: ${{ secrets.SITE_URL }}
+    steps:
+      - name: Checkout private website source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.WEBSITE_REPO }}
+          ref: master
+          token: ${{ secrets.SOURCE_PAT }}
+          path: website-source
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+
+      - name: Install, build and test
+        working-directory: website-source
+        run: |
+          set -euo pipefail
+          test -f bun.lock || {
+            echo "::error::bun.lock is required; the website source must be installed with Bun."
+            exit 1
+          }
+          bun install --frozen-lockfile
+          bun run build
+          bun run test
+
+      - name: Verify build output
+        working-directory: website-source
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || {
+            echo "::error::Expected dist/index.html after build"
+            exit 1
+          }
+          test -f dist/404.html || {
+            echo "::error::Expected dist/404.html after build"
+            exit 1
+          }
+          test -d dist/pagefind || {
+            echo "::error::Expected Pagefind index in dist"
+            exit 1
+          }
+          if find dist -name '*.md' -o -name '*.map' | grep -q .; then
+            echo "::error::Build output contains sources or source maps"
+            exit 1
+          fi
+          echo "Verified dist/ for Pages."
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: website-source
+          packageManager: bun
+          # Must match the Pages production branch to avoid a preview deployment.
+          command: pages deploy dist --project-name=${{ secrets.WEBSITE_PAGES_PROJECT }} --branch=master
