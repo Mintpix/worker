@@ -61,13 +61,30 @@ jobs:
         id: day
         run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve site project directory
+        id: site
+        run: |
+          set -euo pipefail
+          root=website-source
+          if [ -f "$root/web/bun.lock" ] && [ -f "$root/bun.lock" ]; then
+            echo "::error::Both legacy and web/ layouts have a bun.lock; refusing to guess"
+            exit 1
+          elif [ -f "$root/web/bun.lock" ]; then
+            echo "dir=$root/web" >> "$GITHUB_OUTPUT"
+          elif [ -f "$root/bun.lock" ]; then
+            echo "dir=$root" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No bun.lock found in either layout (expected web/bun.lock)"
+            exit 1
+          fi
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.4'
 
       - name: Install, build and test
-        working-directory: website-source
+        working-directory: ${{ steps.site.outputs.dir }}
         env:
           BLOG_VAULT_DIR: ${{ github.workspace }}/content
           BLOG_BUILD_DAY: ${{ steps.day.outputs.value }}
@@ -86,7 +103,7 @@ jobs:
           bun run test
 
       - name: Verify build output
-        working-directory: website-source
+        working-directory: ${{ steps.site.outputs.dir }}
         run: |
           set -euo pipefail
           test -f dist/index.html || {
@@ -129,7 +146,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: website-source
+          workingDirectory: ${{ steps.site.outputs.dir }}
           packageManager: bun
           # Must match the Pages production branch to avoid a preview deployment.
           command: pages deploy dist --project-name=${{ secrets.WEBSITE_PAGES_PROJECT }} --branch=master
