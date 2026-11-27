@@ -21,6 +21,24 @@ jobs:
       # 站点公开地址由 Secret 注入；检查、构建、测试步骤共用，日志不展开该值。
       SITE_URL: ${{ secrets.SITE_URL }}
     steps:
+      - name: Resolve content revision
+        id: content
+        env:
+          SOURCE_PAT: ${{ secrets.SOURCE_PAT }}
+          BLOG_REPO: ${{ secrets.BLOG_REPO }}
+        run: |
+          set -euo pipefail
+          sha=$(curl -fsS \
+            -H "Authorization: Bearer $SOURCE_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$BLOG_REPO/commits/master" \
+            | jq -r '.sha // empty')
+          if [ -z "$sha" ]; then
+            echo "::error::Cannot resolve the master head of the content repository"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Checkout private website source
         uses: actions/checkout@v7
         with:
@@ -30,6 +48,19 @@ jobs:
           path: website-source
           persist-credentials: false
 
+      - name: Checkout content vault
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.BLOG_REPO }}
+          ref: ${{ steps.content.outputs.sha }}
+          token: ${{ secrets.SOURCE_PAT }}
+          path: content
+          persist-credentials: false
+
+      - name: Pin UTC build day
+        id: day
+        run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -37,10 +68,17 @@ jobs:
 
       - name: Install, build and test
         working-directory: website-source
+        env:
+          BLOG_VAULT_DIR: ${{ github.workspace }}/content
+          BLOG_BUILD_DAY: ${{ steps.day.outputs.value }}
         run: |
           set -euo pipefail
           test -f bun.lock || {
             echo "::error::bun.lock is required; the website source must be installed with Bun."
+            exit 1
+          }
+          test "$(git -C "$BLOG_VAULT_DIR" rev-parse HEAD)" = "${{ steps.content.outputs.sha }}" || {
+            echo "::error::Content checkout does not match the resolved revision"
             exit 1
           }
           bun install --frozen-lockfile
@@ -68,6 +106,23 @@ jobs:
             exit 1
           fi
           echo "Verified dist/ for Pages."
+
+      - name: Recheck content branch before deploy
+        env:
+          SOURCE_PAT: ${{ secrets.SOURCE_PAT }}
+          BLOG_REPO: ${{ secrets.BLOG_REPO }}
+          PINNED_SHA: ${{ steps.content.outputs.sha }}
+        run: |
+          set -euo pipefail
+          current=$(curl -fsS \
+            -H "Authorization: Bearer $SOURCE_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$BLOG_REPO/commits/master" \
+            | jq -r '.sha // empty')
+          if [ "$current" != "$PINNED_SHA" ]; then
+            echo "::error::Content branch moved during the build ($PINNED_SHA -> $current); rerun to deploy the new revision"
+            exit 1
+          fi
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v4
