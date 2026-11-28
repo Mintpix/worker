@@ -5,39 +5,51 @@ on:
     types: [website]
   workflow_dispatch:
 
+# Sidecar 关联键：派发运行的显示名必须精确等于 `content-sync <dispatch_id>`（sidecar 用它按
+# display_title 查询运行结果）；手动运行使用另一个前缀，永远不会误匹配某个派发 ID。
+run-name: ${{ case(github.event_name == 'repository_dispatch', format('content-sync {0}', github.event.client_payload.dispatch_id), format('website {0}', github.run_number)) }}
+
 permissions:
   contents: read
 
+# 所有生产部署共用同一个不取消的并发组：已在执行的部署不会被新派发中途替换，每次运行部署
+# 自己拉取的内容。取到执行位之后才开始拉取、解密、构建，不依赖队列顺序。
 concurrency:
   group: website-pages-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
-    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       # 站点公开地址由 Secret 注入；检查、构建、测试步骤共用，日志不展开该值。
       SITE_URL: ${{ secrets.SITE_URL }}
     steps:
-      - name: Resolve content revision
-        id: content
+      # 不用 job 级 if：被 if 跳过的 job 结束成 success，会被 sidecar 当成部署成功。这里显式
+      # 失败，让「不该跑的运行」的结论也是 failure。
+      - name: Refuse to run outside the production branch
         env:
-          SOURCE_PAT: ${{ secrets.SOURCE_PAT }}
-          BLOG_REPO: ${{ secrets.BLOG_REPO }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          sha=$(curl -fsS \
-            -H "Authorization: Bearer $SOURCE_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$BLOG_REPO/commits/master" \
-            | jq -r '.sha // empty')
-          if [ -z "$sha" ]; then
-            echo "::error::Cannot resolve the master head of the content repository"
+          if [ "$REF" != "refs/heads/master" ]; then
+            echo "::error::website.yml only deploys from refs/heads/master (got $REF); refusing to continue" >&2
             exit 1
           fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          DISPATCH_ID: ${{ github.event.client_payload.dispatch_id }}
+        run: |
+          set -euo pipefail
+          # sidecar 只发送 dsp-<uuid4>；其余形状不是它能关联的派发。这里失败（而不是跳过）让
+          # 运行结论保持明确，sidecar 不会把无效派发当作部署成功。
+          if [[ ! "$DISPATCH_ID" =~ ^dsp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::repository_dispatch is missing a well-formed dispatch_id" >&2
+            exit 1
+          fi
 
       - name: Checkout private website source
         uses: actions/checkout@v7
@@ -48,18 +60,103 @@ jobs:
           path: website-source
           persist-credentials: false
 
-      - name: Checkout content vault
-        uses: actions/checkout@v7
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          repository: ${{ secrets.BLOG_REPO }}
-          ref: ${{ steps.content.outputs.sha }}
-          token: ${{ secrets.SOURCE_PAT }}
-          path: content
-          persist-credentials: false
+          bun-version: '1.4.4'
+
+      - name: Pull and decrypt the published content
+        env:
+          # runner 上下文只在 step 级可用（job 级 env 会报 Unrecognized named-value）.
+          BLOG_VAULT_DIR: ${{ runner.temp }}/published-vault
+          CONTENT_COUCHDB_URI: ${{ secrets.CONTENT_COUCHDB_URI }}
+          # Single admin identity on the NAS backend: user and database are fixed, not secrets.
+          CONTENT_COUCHDB_USER: admin
+          CONTENT_COUCHDB_DATABASE: obsidian
+          CONTENT_COUCHDB_PASSWORD: ${{ secrets.PASSWD }}
+          LIVESYNC_PASSPHRASE: ${{ secrets.PASSWD }}
+          # Cloudflare's Bot Fight Mode challenges "known bot" user agents on this zone. A browser
+          # user agent is what makes the request look like the Obsidian client (verified: 401 vs 403).
+          COUCH_USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+          # 阻断门：在合成库上验证 fetch 无回写、且 Actions→CouchDB 的私网连通路径经核实之前，
+          # 配好 Secrets 也不启用生产拉取。两个条件都验证后，才在仓库变量里显式置 yes。
+          CONTENT_PULL_VERIFIED: ${{ vars.CONTENT_PULL_VERIFIED }}
+        run: |
+          set -euo pipefail
+          if [ "${CONTENT_PULL_VERIFIED:-}" != "yes" ]; then
+            echo "::error::Refusing to pull from CouchDB: write-back behaviour on a synthetic database and the Actions-to-CouchDB network path are not verified yet. Verify both, then set the repository variable CONTENT_PULL_VERIFIED=yes." >&2
+            exit 1
+          fi
+          umask 077
+          # 先探测端点本身是否真在说 CouchDB 协议。只打印状态码、内容类型与响应体片段（不含
+          # 请求 URI，凭据不在响应里）；拿到 HTML 就说明请求被中间层（CDN 挑战页/错路由）接管了。
+          raw="$(curl -sS -A "$COUCH_USER_AGENT" --max-time 20 -w '\n@@%{http_code} %{content_type}' "$CONTENT_COUCHDB_URI/" 2>&1 || true)"
+          probe="${raw##*@@}"
+          body="$(printf '%s' "${raw%@@*}" | tr -d '\r\n' | head -c 200)"
+          echo "endpoint probe: $probe"
+          echo "endpoint body: $body"
+          hdr="$(curl -sS -o /dev/null -D - --max-time 20 "$CONTENT_COUCHDB_URI/" 2>&1 | tr -d '\r' | grep -iE '^(server|cf-mitigated|cf-ray|cf-cache-status):' | tr '\n' ' ' || true)"
+          echo "endpoint headers: $hdr"
+          # Same URL, same user agent, but Node's TLS/HTTP2 stack instead of curl's. This is the
+          # experiment that separates "the UA is not being sent" from "the client fingerprint is
+          # challenged": curl passes with this UA while the CLI (Node) is served a challenge page.
+          node_probe="$(node --input-type=module -e '
+            const r = await fetch(process.env.CONTENT_COUCHDB_URI + "/", {
+              headers: { "user-agent": process.env.COUCH_USER_AGENT },
+            });
+            console.log(r.status, r.headers.get("content-type"), r.headers.get("cf-mitigated"));
+          ' 2>&1 || echo 'node-probe-failed')"
+          echo "node probe: $node_probe"
+          case "$probe" in
+            *text/html*) ;;
+            200\ application/json*|401\ *|403\ *) probe_ok=1 ;;
+            *) probe_ok= ;;
+          esac
+          if [ "${probe_ok:-}" != 1 ]; then
+            echo "::error::CONTENT_COUCHDB_URI did not answer as a CouchDB endpoint (got: $probe). Expected 401, or 200 with application/json." >&2
+            exit 1
+          fi
+          # LiveSync 设置放在临时库目录的默认位置（.livesync/settings.json），由 CLI 自己维护：
+          # fetch 在保留 database 后缀或应用迁移时可能重写设置，:ro 挂载或外置只读文件都会让
+          # 它失败。jq 用 env.* 引用凭据，秘密不出现在 argv。目录与设置随 trap 清理，失败路径
+          # 也清。
+          db_dir="$RUNNER_TEMP/livesync-db"
+          mkdir -p "$db_dir/.livesync"
+          settings="$db_dir/.livesync/settings.json"
+          trap 'sudo rm -rf "$RUNNER_TEMP/livesync-db"' EXIT
+          ( set -o noclobber; printf '%s' '' > "$settings" ) || {
+            echo "::error::Refusing to overwrite an existing settings file in a fresh runner" >&2
+            exit 1
+          }
+          jq -n '{
+            couchDB_URI: env.CONTENT_COUCHDB_URI,
+            couchDB_USER: env.CONTENT_COUCHDB_USER,
+            couchDB_PASSWORD: env.CONTENT_COUCHDB_PASSWORD,
+            couchDB_DBNAME: env.CONTENT_COUCHDB_DATABASE,
+            couchDB_CustomHeaders: ("User-Agent: " + env.COUCH_USER_AGENT),
+            encrypt: true,
+            passphrase: env.LIVESYNC_PASSPHRASE,
+            isConfigured: true
+          }' > "$settings"
+          mkdir "$BLOG_VAULT_DIR"
+          # fetch 用远端状态整体替换临时本地库，再把解密后的文件写入空的 vault 目录：每次
+          # 运行都无状态地部署当前远端内容，本地状态不可能回放或遮蔽旧版本。vault 是否为空
+          # 不在这里判断：完整拉取后的真正空集（远端被清空）与拉取失败，由 fetch 自身的退出
+          # 码和后续门禁区分，不能拿 ls 当完整性证明。
+          # 镜像按版本标签固定；entrypoint 会自动把 /data 作为 database-path 传入。
+          # CouchDB 入口必须是 Actions 可达且经认证的地址；连不上时本步失败，整个运行失败，
+          # Pages 保留上一版，sidecar 的待办批次不会被清除。
+          docker run --rm \
+            -v "$db_dir:/data" \
+            -v "$BLOG_VAULT_DIR:/vault" \
+            ghcr.io/vrtmrz/livesync-cli:1.0.40-cli \
+            --vault /vault fetch --force
 
       - name: Pin UTC build day
         id: day
-        run: echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          echo "value=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Resolve site project directory
         id: site
@@ -78,27 +175,23 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.4.4'
-
       - name: Install, build and test
         working-directory: ${{ steps.site.outputs.dir }}
         env:
-          BLOG_VAULT_DIR: ${{ github.workspace }}/content
           BLOG_BUILD_DAY: ${{ steps.day.outputs.value }}
+          BLOG_VAULT_DIR: ${{ runner.temp }}/published-vault
         run: |
           set -euo pipefail
           test -f bun.lock || {
             echo "::error::bun.lock is required; the website source must be installed with Bun."
             exit 1
           }
-          test "$(git -C "$BLOG_VAULT_DIR" rev-parse HEAD)" = "${{ steps.content.outputs.sha }}" || {
-            echo "::error::Content checkout does not match the resolved revision"
-            exit 1
-          }
           bun install --frozen-lockfile
+          # 输出门禁不信任构建产物自报的清单：用同一套 vault 规则独立声明预期文章集，测试
+          # 再把产物与这份声明比对，抓 Astro/加载器丢页一类的问题。空集是合法声明。声明
+          # 必须在依赖安装之后（工具链有 npm 依赖）；命令替换让声明的非零退出直接失败本步。
+          posts="$(bun tooling/declare-posts.ts)"
+          export BLOG_EXPECTED_POSTS="$posts"
           bun run build
           bun run test
 
@@ -114,34 +207,22 @@ jobs:
             echo "::error::Expected dist/404.html after build"
             exit 1
           }
-          test -d dist/pagefind || {
-            echo "::error::Expected Pagefind index in dist"
-            exit 1
-          }
+          # Pagefind 只在构建产出文章页时要求：撤掉最后一篇文章是合法结果，不 article 的构建
+          # 本来就不生成索引；这里区分「拉取失败」（上一步已拦）与「完整拉取后零公开文章」。
+          if [ -d dist/posts ] && find dist/posts -name 'index.html' | grep -q .; then
+            test -d dist/pagefind || {
+              echo "::error::Expected Pagefind index in dist"
+              exit 1
+            }
+          fi
           if find dist -name '*.md' -o -name '*.map' | grep -q .; then
             echo "::error::Build output contains sources or source maps"
             exit 1
           fi
           echo "Verified dist/ for Pages."
 
-      - name: Recheck content branch before deploy
-        env:
-          SOURCE_PAT: ${{ secrets.SOURCE_PAT }}
-          BLOG_REPO: ${{ secrets.BLOG_REPO }}
-          PINNED_SHA: ${{ steps.content.outputs.sha }}
-        run: |
-          set -euo pipefail
-          current=$(curl -fsS \
-            -H "Authorization: Bearer $SOURCE_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$BLOG_REPO/commits/master" \
-            | jq -r '.sha // empty')
-          if [ "$current" != "$PINNED_SHA" ]; then
-            echo "::error::Content branch moved during the build ($PINNED_SHA -> $current); rerun to deploy the new revision"
-            exit 1
-          fi
-
       - name: Deploy to Cloudflare Pages
+        id: deploy
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -150,3 +231,53 @@ jobs:
           packageManager: bun
           # Must match the Pages production branch to avoid a preview deployment.
           command: pages deploy dist --project-name=${{ secrets.WEBSITE_PAGES_PROJECT }} --branch=master
+
+      # workflow success 必须等于「本次 Pages 生产部署真实成功」：按本次部署的 ID 回查目标
+      # 项目、production 环境与部署终态；预览、跳过、失败或无法确认都让运行失败，sidecar 不
+      # 会清待办批次。
+      - name: Confirm the production deployment
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PROJECT_NAME: ${{ secrets.WEBSITE_PAGES_PROJECT }}
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.pages-deployment-id }}
+          DEPLOYMENT_ENVIRONMENT: ${{ steps.deploy.outputs.pages-environment }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOYMENT_ID" ]; then
+            echo "::error::The deploy step did not report a Pages deployment id" >&2
+            exit 1
+          fi
+          if [ "$DEPLOYMENT_ENVIRONMENT" != "production" ]; then
+            echo "::error::The deployment was not a production deployment (environment: ${DEPLOYMENT_ENVIRONMENT:-<missing>})" >&2
+            exit 1
+          fi
+          # 凭据走 curl -K 的 /dev/fd 配置，不进 argv。
+          query() {
+            curl -fsS --max-time 30 \
+              -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROJECT_NAME/deployments/$DEPLOYMENT_ID"
+          }
+          deadline=$((SECONDS + ${CONFIRM_DEADLINE_SECONDS:-120}))
+          until result="$(query)"; do
+            [ "$SECONDS" -lt "$deadline" ] || {
+              echo "::error::Could not retrieve deployment $DEPLOYMENT_ID for verification" >&2
+              exit 1
+            }
+            sleep 2
+          done
+          # 终态核对：本次部署 ID、目标项目、production、非跳过、部署阶段成功。任何一项
+          # 不符都失败——只有 build 阶段成功、或回查到别的部署，都不算数。
+          jq -e --arg project "$PROJECT_NAME" --arg id "$DEPLOYMENT_ID" '
+            .success == true and
+            .result.id == $id and
+            .result.project_name == $project and
+            .result.environment == "production" and
+            .result.is_skipped == false and
+            .result.latest_stage.name == "deploy" and
+            .result.latest_stage.status == "success"
+          ' <<<"$result" >/dev/null || {
+            echo "::error::Deployment $DEPLOYMENT_ID did not reach a verified production success for $PROJECT_NAME" >&2
+            exit 1
+          }
+          echo "Verified production deployment $DEPLOYMENT_ID of $PROJECT_NAME."
